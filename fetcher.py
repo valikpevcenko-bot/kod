@@ -1,4 +1,4 @@
-"""Быстрая загрузка цен: пул CCXT + параллельные запросы."""
+"""Быстрая загрузка: REST-цены + кэш D/W и контрактов."""
 
 from __future__ import annotations
 
@@ -6,178 +6,139 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-import ccxt.async_support as ccxt
-
+from contracts import fetch_contracts, get_cached as contracts_cached
+from fast_prices import FAST
 from links import futures_url, spot_url
-from models import ExchangeSnapshot, MarketTicker
-from pool import REQUEST_TIMEOUT_MS, get_exchange
-from ticker_parser import to_ccxt_spot_symbol, to_ccxt_swap_symbol
-from contracts import fetch_contracts
-from wallet import fetch_wallet
+from models import ContractInfo, ExchangeSnapshot, MarketTicker
+from wallet import enrich_wallet, fetch_wallet
+from wallet_cache import get as wallet_cached, set as wallet_cache_set
 
 logger = logging.getLogger(__name__)
 
-# Порядок как на референс-скриншоте
+# Лимит на весь /get (сек) — укладываемся ~1 с
+FETCH_BUDGET = 0.95
+
 EXCHANGE_DEFS: list[dict[str, Any]] = [
-    {"key": "binance", "name": "Binance", "spot_class": "binance", "futures_class": "binanceusdm"},
-    {
-        "key": "bybit",
-        "name": "Bybit",
-        "spot_class": "bybit",
-        "futures_class": "bybit",
-        "futures_options": {"options": {"defaultType": "linear"}},
-    },
-    {
-        "key": "gate",
-        "name": "Gate.io",
-        "spot_class": "gate",
-        "futures_class": "gate",
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {
-        "key": "mexc",
-        "name": "MEXC",
-        "spot_class": "mexc",
-        "futures_class": "mexc",
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {
-        "key": "bitget",
-        "name": "Bitget",
-        "spot_class": "bitget",
-        "futures_class": "bitget",
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {
-        "key": "okx",
-        "name": "OKX",
-        "spot_class": "okx",
-        "futures_class": "okx",
-        "spot_options": {"options": {"defaultType": "spot"}},
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {"key": "kucoin", "name": "KuCoin", "spot_class": "kucoin", "futures_class": "kucoinfutures"},
-    {
-        "key": "bingx",
-        "name": "BingX",
-        "spot_class": "bingx",
-        "futures_class": "bingx",
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {
-        "key": "htx",
-        "name": "HTX",
-        "spot_class": "htx",
-        "futures_class": "htx",
-        "futures_options": {"options": {"defaultType": "swap"}},
-    },
-    {"key": "aster", "name": "AsterDex", "futures_class": "aster", "futures_only": True},
-    {"key": "hyperliquid", "name": "Hyperliquid", "futures_class": "hyperliquid", "futures_only": True},
+    {"key": "binance", "name": "Binance", "futures_only": False},
+    {"key": "bybit", "name": "Bybit", "futures_only": False},
+    {"key": "gate", "name": "Gate.io", "futures_only": False},
+    {"key": "mexc", "name": "MEXC", "futures_only": False},
+    {"key": "bitget", "name": "Bitget", "futures_only": False},
+    {"key": "okx", "name": "OKX", "futures_only": False},
+    {"key": "kucoin", "name": "KuCoin", "futures_only": False},
+    {"key": "bingx", "name": "BingX", "futures_only": False},
+    {"key": "htx", "name": "HTX", "futures_only": False},
+    {"key": "aster", "name": "AsterDex", "futures_only": True},
+    {"key": "hyperliquid", "name": "Hyperliquid", "futures_only": True},
 ]
 
-_TICKER_TIMEOUT = REQUEST_TIMEOUT_MS / 1000 + 1
 
-
-def _swap_symbol(key: str, base: str, quote: str) -> str:
-    if key == "hyperliquid" and quote.upper() == "USDT":
-        return f"{base}/USDC:USDC"
-    return to_ccxt_swap_symbol(base, quote)
-
-
-async def _fetch_ticker(
-    class_name: str,
-    symbol: str,
-    extra: Optional[dict],
-) -> Optional[float]:
-    try:
-        ex = await get_exchange(class_name, extra)
-        raw = await asyncio.wait_for(ex.fetch_ticker(symbol), timeout=_TICKER_TIMEOUT)
-        price = raw.get("last") or raw.get("close")
-        return float(price) if price is not None else None
-    except (asyncio.TimeoutError, ccxt.BadSymbol, ccxt.NetworkError, ccxt.ExchangeError):
-        return None
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("%s %s: %s", class_name, symbol, exc)
-        return None
-
-
-async def _fetch_prices(defn: dict[str, Any], base: str, quote: str) -> ExchangeSnapshot:
-    """Только цены — максимально быстро."""
+async def _fetch_one_prices(defn: dict[str, Any], base: str, quote: str) -> ExchangeSnapshot:
     key = defn["key"]
-    spot_sym = to_ccxt_spot_symbol(base, quote)
-    swap_sym = _swap_symbol(key, base, quote)
-
-    coros: list[Any] = []
-    kinds: list[str] = []
-
-    if defn.get("spot_class"):
-        coros.append(
-            _fetch_ticker(defn["spot_class"], spot_sym, defn.get("spot_options"))
-        )
-        kinds.append("spot")
-    if defn.get("futures_class"):
-        coros.append(
-            _fetch_ticker(defn["futures_class"], swap_sym, defn.get("futures_options"))
-        )
-        kinds.append("futures")
-
-    results = await asyncio.gather(*coros, return_exceptions=True)
-
-    def _val(kind: str) -> Any:
-        if kind not in kinds:
-            return None
-        r = results[kinds.index(kind)]
-        return None if isinstance(r, BaseException) else r
-
     snap = ExchangeSnapshot(
         key=key,
         name=defn["name"],
         futures_only=bool(defn.get("futures_only")),
     )
+    fetcher = FAST.get(key)
+    if not fetcher:
+        return snap
+    try:
+        spot_p, fut_p = await fetcher(base, quote)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("fast price %s: %s", key, exc)
+        return snap
 
-    spot_price = _val("spot")
-    fut_price = _val("futures")
-
-    if spot_price is not None:
-        snap.spot = MarketTicker(spot_price, spot_url(key, base, quote))
-    if fut_price is not None:
-        snap.futures = MarketTicker(fut_price, futures_url(key, base, quote))
-
+    if spot_p is not None:
+        snap.spot = MarketTicker(spot_p, spot_url(key, base, quote))
+    if fut_p is not None:
+        snap.futures = MarketTicker(fut_p, futures_url(key, base, quote))
     return snap
 
 
-async def fetch_all(
-    base: str, quote: str
-) -> tuple[list[ExchangeSnapshot], list]:
-    """Цены → контракты с бирж → D/W по тем же сетям."""
-    prices_raw = await asyncio.gather(
-        *[_fetch_prices(d, base, quote) for d in EXCHANGE_DEFS],
-        return_exceptions=True,
-    )
+def _attach_wallets(
+    snapshots: list[ExchangeSnapshot],
+    base: str,
+    fresh_wallets: Optional[dict[str, Any]] = None,
+) -> None:
+    for snap in snapshots:
+        if snap.futures_only:
+            continue
+        w = None
+        if fresh_wallets:
+            w = fresh_wallets.get(snap.key)
+        if w is None:
+            w = wallet_cached(snap.key, base)
+        snap.wallet = w
+
+
+async def fetch_all_fast(
+    base: str,
+    quote: str,
+) -> tuple[list[ExchangeSnapshot], list[ContractInfo]]:
+    """
+    Укладывается в ~1 с: только REST-цены + кэш контрактов/D/W.
+    """
+    contracts = contracts_cached(base)
+
+    try:
+        prices_raw = await asyncio.wait_for(
+            asyncio.gather(
+                *[_fetch_one_prices(d, base, quote) for d in EXCHANGE_DEFS],
+                return_exceptions=True,
+            ),
+            timeout=FETCH_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("prices timeout %s", base)
+        prices_raw = []
 
     out: list[ExchangeSnapshot] = []
     for item in prices_raw:
         if isinstance(item, ExchangeSnapshot) and item.has_data:
             out.append(item)
 
-    listed = [s.key for s in out]
-    contracts = await fetch_contracts(base, listed_on=listed)
-    contract_networks = [c.network for c in contracts]
-
-    wallets_raw = await asyncio.gather(
-        *[
-            fetch_wallet(d["key"], base, contract_networks)
-            for d in EXCHANGE_DEFS
-        ],
-        return_exceptions=True,
-    )
-
-    wallets: dict[str, Any] = {}
-    for defn, w in zip(EXCHANGE_DEFS, wallets_raw):
-        if not isinstance(w, BaseException):
-            wallets[defn["key"]] = w
-
-    for snap in out:
-        snap.wallet = wallets.get(snap.key)
-
+    _attach_wallets(out, base)
     return out, contracts
+
+
+async def fetch_all_full(
+    base: str,
+    quote: str,
+    snapshots: list[ExchangeSnapshot],
+    contracts: list[ContractInfo],
+) -> tuple[list[ExchangeSnapshot], list[ContractInfo]]:
+    """Фоновое обновление: контракты и D/W параллельно, D/W с учётом сетей контрактов."""
+    listed = [s.key for s in snapshots]
+    spot_defns = [d for d in EXCHANGE_DEFS if not d.get("futures_only")]
+
+    full_contracts, wallets_raw = await asyncio.gather(
+        fetch_contracts(base, listed_on=listed or None),
+        asyncio.gather(
+            *[fetch_wallet(d["key"], base, None) for d in spot_defns],
+            return_exceptions=True,
+        ),
+    )
+    if not isinstance(full_contracts, list):
+        full_contracts = contracts
+    if not full_contracts:
+        full_contracts = contracts
+
+    contract_networks = [c.network for c in full_contracts]
+
+    fresh: dict[str, Any] = {}
+    for defn, w in zip(spot_defns, wallets_raw):
+        if isinstance(w, Exception):
+            logger.debug("wallet %s %s: %s", defn["key"], base, w)
+            continue
+        w = enrich_wallet(w, base, contract_networks)
+        fresh[defn["key"]] = w
+        wallet_cache_set(defn["key"], base, w)
+
+    _attach_wallets(snapshots, base, fresh)
+    return snapshots, full_contracts
+
+
+# Совместимость
+async def fetch_all(base: str, quote: str) -> tuple[list[ExchangeSnapshot], list]:
+    return await fetch_all_fast(base, quote)

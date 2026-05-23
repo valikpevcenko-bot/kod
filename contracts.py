@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 _SSL = ssl.create_default_context(cafile=certifi.where())
 _CACHE: dict[str, tuple[float, list[ContractInfo]]] = {}
 _CACHE_TTL = 600
+# Быстрый путь: отдаём последний кэш, не ждём тяжёлый Binance bapi
+_MEM: dict[str, tuple[float, list[ContractInfo]]] = {}
+_MEM_TTL = 600
 _BINANCE_COINS: tuple[float, list] | None = None
 
 _EVM_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -340,6 +343,26 @@ _EXCHANGE_FETCHERS = {
 }
 
 
+def get_cached(symbol: str) -> list[ContractInfo]:
+    """Мгновенно — без HTTP (для ответа за 1 сек)."""
+    item = _MEM.get(symbol.upper())
+    if not item:
+        return []
+    if time.time() - item[0] > _MEM_TTL:
+        return []
+    return item[1]
+
+
+def _mem_store(symbol: str, contracts: list[ContractInfo]) -> None:
+    if contracts:
+        _MEM[symbol.upper()] = (time.time(), contracts)
+
+
+async def preload_binance_coins() -> None:
+    """Прогрев списка сетей Binance — контракты/D/W быстрее на первом /get."""
+    await _binance_rows("BTC")
+
+
 async def fetch_contracts(
     symbol: str,
     listed_on: Optional[list[str]] = None,
@@ -385,4 +408,5 @@ async def fetch_contracts(
                 break
 
     _CACHE[key] = (time.time(), contracts)
+    _mem_store(key, contracts)
     return contracts
