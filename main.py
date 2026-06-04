@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-compatible launcher — delegates to crypto_bot package."""
+"""Production entry: python main.py"""
 
 from crypto_bot.main import main
 

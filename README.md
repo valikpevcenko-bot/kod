@@ -1,165 +1,69 @@
-# 📊 Crypto Price Telegram Bot
+# Crypto Telegram Bot
 
-Telegram-бот на **Python + CCXT + aiogram 3.x**.  
-По команде `/get BTCUSDT` показывает **Spot** и **Futures** цены, **изменение за 24ч** и **ссылки** на торговые пары.
+Telegram-бот на **Python 3.12+, aiogram 3.x, httpx, pydantic-settings, structlog**.  
+Команда `/get <тикер>` — spot, perpetual futures, funding, D/W, контракты с 11 бирж.
 
-## 🏦 Поддерживаемые биржи
+## Биржи (порядок в отчёте)
 
-| Биржа | Spot | Futures |
-|--------|------|---------|
-| Binance | ✅ | ✅ |
-| Bybit | ✅ | ✅ |
-| OKX | ✅ | ✅ |
-| Gate.io | ✅ | ✅ |
-| MEXC | ✅ | ✅ |
-| Bitget | ✅ | ✅ |
-| KuCoin | ✅ | ✅ |
-| BingX | ✅ | ✅ |
-| HTX | ✅ | ✅ |
-| Hyperliquid | — | ✅ |
+Binance → Bybit → Gate.io → MEXC → Bitget → OKX → KuCoin → BingX → AsterDEX → Hyperliquid
 
----
+## Структура (Feature-Sliced)
 
-## 🚀 Пошаговый запуск (для новичка)
-
-### Шаг 1. Установи Python
-
-Нужен **Python 3.10+**.
-
-Проверка в терминале:
-
-```bash
-python3 --version
+```
+crypto_bot/
+├── main.py              # Точка входа
+├── app.py               # Dispatcher, lifecycle
+├── config/settings.py   # .env (pydantic-settings)
+├── core/                # http, retry, guards, logging
+├── models/              # Pydantic domain models
+├── domain/              # exchanges registry, links, ticker parser
+├── clients/
+│   ├── coinmarketcap.py
+│   └── exchanges/market.py
+├── services/
+│   ├── market_service.py
+│   ├── wallet.py
+│   ├── contracts.py
+│   ├── formatter.py
+│   └── report_cache.py
+└── handlers/            # /start, /get, errors
 ```
 
-### Шаг 2. Скачай проект и открой папку
-
-```bash
-cd /Users/valentynpevchenko/Documents/crypto-telegram-bot
-```
-
-### Шаг 3. Создай виртуальное окружение
-
-```bash
-python3 -m venv .venv
-```
-
-Активация:
-
-- **macOS / Linux:**
-  ```bash
-  source .venv/bin/activate
-  ```
-- **Windows:**
-  ```cmd
-  .venv\Scripts\activate
-  ```
-
-После активации в начале строки терминала появится `(.venv)`.
-
-### Шаг 4. Установи зависимости
-
-```bash
-pip install -r requirements.txt
-```
-
-### Шаг 5. Создай бота в Telegram
-
-1. Открой [@BotFather](https://t.me/BotFather)
-2. Отправь `/newbot`
-3. Придумай имя и username
-4. Скопируй **токен** (выглядит как `123456789:AA...`)
-
-### Шаг 6. Настрой `.env`
+## Быстрый старт
 
 ```bash
 cp .env.example .env
+# Вставь BOT_TOKEN от @BotFather
+
+bash start.sh
+# или: python3 -m venv .venv && source .venv/bin/activate
+# pip install -r requirements.txt && python -m crypto_bot.main
 ```
 
-Открой файл `.env` в любом редакторе и вставь токен:
+В Telegram: `/get sol`, `/get btc`, `/get ethusdt`
 
-```
-BOT_TOKEN=твой_токен_от_BotFather
-```
-
-### Шаг 7. Запусти бота
+## Docker
 
 ```bash
-python bot.py
+docker build -t crypto-bot .
+docker run --env-file .env crypto-bot
 ```
 
-В терминале должно появиться: `Бот запущен. Ожидаю сообщения…`
+## systemd
 
-### Шаг 8. Проверь в Telegram
-
-1. Найди своего бота по username
-2. Нажми **Start**
-3. Отправь:
-   ```
-   /get BTCUSDT
-   /get ETHUSDT
-   /get SOLUSDT
-   ```
-
----
-
-## 📁 Структура проекта
-
-```
-crypto-telegram-bot/
-├── bot.py           # Точка входа, команды Telegram
-├── config.py        # Загрузка BOT_TOKEN из .env
-├── ticker_parser.py # Разбор BTCUSDT → BTC + USDT
-├── fetcher.py       # Запросы к биржам через CCXT (async)
-├── formatter.py     # Красивый Markdown-ответ
-├── links.py         # URL торговых пар
-├── models.py        # Структуры данных
-├── requirements.txt
-├── .env.example
-└── README.md
+```bash
+sudo cp deploy/crypto-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-bot
 ```
 
----
+## Опционально
 
-## 💬 Команды бота
+- `CMC_API_KEY` — контракты и disambiguation через CoinMarketCap Pro
+- API-ключи бирж — D/W для Bybit, OKX, BingX (read-only; OKX: IP whitelist на okx.com)
 
-| Команда | Описание |
-|---------|----------|
-| `/start` | Приветствие и справка |
-| `/help` | То же, что `/start` |
-| `/get TICKER` | Цены по всем биржам |
+## Тесты
 
-**Примеры тикеров:** `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BTC/USDT`, `SOL` (по умолчанию к USDT).
-
----
-
-## ⚙️ Дополнительные настройки
-
-В `.env` можно задать котируемую валюту по умолчанию (если ввели только базу):
-
+```bash
+python test_bot_guards.py
 ```
-DEFAULT_QUOTE=USDT
-```
-
----
-
-## ❓ Частые проблемы
-
-**`❌ Не найден BOT_TOKEN`**  
-→ Создай файл `.env` и добавь `BOT_TOKEN=...`
-
-**Бот не отвечает**  
-→ Убедись, что `python bot.py` запущен и нет ошибок в терминале.
-
-**«Тикер не найден»**  
-→ Проверь, что монета торгуется к USDT на биржах (например `PEPEUSDT`).
-
-**Долгий ответ**  
-→ Бот опрашивает ~10 бирж; первый запрос может занять 5–15 секунд.
-
----
-
-## 📜 Лицензия
-
-Свободное использование в личных целях.
-# info-bot

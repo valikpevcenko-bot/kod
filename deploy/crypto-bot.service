@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/crypto-telegram-bot
+EnvironmentFile=/opt/crypto-telegram-bot/.env
+ExecStart=/opt/crypto-telegram-bot/.venv/bin/python -m crypto_bot.main
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
