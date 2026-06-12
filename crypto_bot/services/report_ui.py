@@ -8,7 +8,12 @@ _LOADING_FOOTER = f"\n\n<i>{_LOADING_MARK} Loading exchanges…</i>"
 
 
 def needs_more_exchanges(exchange_count: int, *, target: int) -> bool:
-    return exchange_count < target
+    return exchange_count > 0 and exchange_count < target
+
+
+def show_loading_footer(exchange_count: int, *, target: int) -> bool:
+    """Footer only while report is thin — avoids flicker when 6+ exchanges already shown."""
+    return needs_more_exchanges(exchange_count, target=target)
 
 
 def with_loading_footer(text: str) -> str:

@@ -14,7 +14,7 @@ BURST_EXCHANGE_KEYS: Final[frozenset[str]] = frozenset(
         "bitget",
         "okx",
         "bingx",
-        "htx",
+        "kraken",
         "aster",
         "hyperliquid",
     }
@@ -32,6 +32,17 @@ FAST_BURST_MIN: Final[int] = 4
 FAST_FETCH_TIMEOUT: Final[float] = 0.88
 FETCH_HARD_TIMEOUT: Final[float] = 2.2
 
+# TURBO_MODE / ASIA_VPS — progressive paint + enrich (Vultr JP / low RTT to CEX)
+TURBO_FETCH_TIMEOUT: Final[float] = 0.82
+TURBO_EXCHANGE_TIMEOUT_FAST: Final[float] = 0.44
+TURBO_EXCHANGE_TIMEOUT_SLOW: Final[float] = 0.82
+TURBO_FUNDING_TIMEOUT: Final[float] = 0.55
+TURBO_BACKFILL_TIMEOUT: Final[float] = 0.16
+TURBO_ENRICH_PRICES_TIMEOUT: Final[float] = 2.2
+TURBO_WALLET_PHASE_TIMEOUT: Final[float] = 5.5
+TURBO_PRICE_CONTINUATION_TIMEOUT: Final[float] = 2.6
+LOADING_FOOTER_MIN_EXCHANGES: Final[int] = 6
+
 ENRICH_PRICES_TIMEOUT: Final[float] = 7.5
 ENRICH_RETRY_TIMEOUT: Final[float] = 4.0
 ENRICH_JOB_TIMEOUT: Final[float] = 42.0
@@ -41,7 +52,7 @@ PER_EXCHANGE_TIMEOUT: Final[float] = 2.4
 EXCHANGE_PRICE_TIMEOUT: Final[dict[str, float]] = {
     "gate": 8.5,
     "mexc": 3.5,
-    "htx": 3.2,
+    "kraken": 3.0,
     "kucoin": 3.2,
     "okx": 2.8,
     "aster": 3.5,
@@ -64,7 +75,7 @@ RETRY_EXCHANGE_PRIORITY: Final[tuple[str, ...]] = (
     "gate",
     "mexc",
     "kucoin",
-    "htx",
+    "kraken",
     "okx",
     "bingx",
     "aster",
@@ -109,7 +120,7 @@ EXCHANGE_DEFS: list[ExchangeDef] = [
     ExchangeDef("okx", "OKX"),
     ExchangeDef("kucoin", "KuCoin"),
     ExchangeDef("bingx", "BingX"),
-    ExchangeDef("htx", "HTX"),
+    ExchangeDef("kraken", "Kraken"),
     ExchangeDef("aster", "AsterDEX"),
     ExchangeDef("hyperliquid", "Hyperliquid", futures_only=True),
 ]

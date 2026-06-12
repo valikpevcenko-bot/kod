@@ -206,10 +206,12 @@ def _exchange_line(snap: ExchangeSnapshot) -> str:
 
 
 def _network_label(net: NetworkWallet, symbol: str, exchange_key: str) -> str:
+    from crypto_bot.domain.network_registry import NETWORK_DISPLAY
+
     api_coin = (net.exchange_coin or "").strip().upper()
     if exchange_key == "bingx" and api_coin and api_coin != symbol.upper():
         return f"{net.network} · {api_coin}"
-    return net.network
+    return NETWORK_DISPLAY.get(net.network, net.network)
 
 
 def _network_lines(

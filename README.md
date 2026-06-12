@@ -5,7 +5,7 @@ Telegram-бот на **Python 3.12+, aiogram 3.x, httpx, pydantic-settings, stru
 
 ## Биржи (порядок в отчёте)
 
-Binance → Bybit → Gate.io → MEXC → Bitget → OKX → KuCoin → BingX → AsterDEX → Hyperliquid
+Binance → Bybit → Gate.io → MEXC → Bitget → OKX → KuCoin → BingX → Kraken → AsterDEX → Hyperliquid
 
 ## Структура (Feature-Sliced)
 

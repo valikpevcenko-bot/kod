@@ -5,7 +5,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Self
 
-from pydantic import Field, SecretStr, field_validator
+import os
+
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +41,8 @@ class Settings(BaseSettings):
     kucoin_api_key: SecretStr | None = Field(default=None, alias="KUCOIN_API_KEY")
     kucoin_api_secret: SecretStr | None = Field(default=None, alias="KUCOIN_API_SECRET")
     kucoin_api_passphrase: SecretStr | None = Field(default=None, alias="KUCOIN_API_PASSPHRASE")
+    kraken_api_key: SecretStr | None = Field(default=None, alias="KRAKEN_API_KEY")
+    kraken_api_secret: SecretStr | None = Field(default=None, alias="KRAKEN_API_SECRET")
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     http_timeout: float = Field(default=0.55, alias="HTTP_TIMEOUT")
@@ -48,6 +52,29 @@ class Settings(BaseSettings):
     fast_cache_ttl: int = Field(default=75, alias="FAST_CACHE_TTL")
     fast_wait_ms: int = Field(default=320, alias="FAST_WAIT_MS")
     dw_cache_ttl: int = Field(default=600, alias="DW_CACHE_TTL")
+    turbo_mode: bool = Field(default=False, alias="TURBO_MODE")
+    asia_vps: bool = Field(default=False, alias="ASIA_VPS")
+    enrich_split: bool = Field(default=True, alias="ENRICH_SPLIT")
+    first_response_sec: float = Field(default=0.9, alias="FIRST_RESPONSE_SEC")
+    first_paint_ms: int = Field(default=300, alias="FIRST_PAINT_MS")
+    http_connect_timeout: float = Field(default=0.28, alias="HTTP_CONNECT_TIMEOUT")
+    http_proxy: str | None = Field(default=None, alias="HTTP_PROXY")
+
+    @field_validator("turbo_mode", "asia_vps", "enrich_split", mode="before")
+    @classmethod
+    def _boolish(cls, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    @model_validator(mode="after")
+    def _asia_profile(self) -> Self:
+        """Vultr Tokyo / JP proxy: enable turbo stack when ASIA_VPS=1."""
+        if self.asia_vps and not self.turbo_mode:
+            self.turbo_mode = True
+        return self
 
     @field_validator("default_quote")
     @classmethod
@@ -82,6 +109,7 @@ class Settings(BaseSettings):
             "bingx": (self.bingx_api_key, self.bingx_api_secret, None),
             "bitget": (self.bitget_api_key, self.bitget_api_secret, self.bitget_api_passphrase),
             "kucoin": (self.kucoin_api_key, self.kucoin_api_secret, self.kucoin_api_passphrase),
+            "kraken": (self.kraken_api_key, self.kraken_api_secret, None),
         }
         keys = mapping.get(exchange_key)
         if not keys:
@@ -104,6 +132,14 @@ class Settings(BaseSettings):
         if self.cmc_api_key is None:
             return None
         return self.cmc_api_key.get_secret_value() or None
+
+    def outbound_proxy(self) -> str | None:
+        return (
+            (self.http_proxy or "").strip()
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("HTTP_PROXY")
+            or None
+        )
 
     @classmethod
     @lru_cache(maxsize=1)

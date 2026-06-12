@@ -42,14 +42,30 @@ class BotApp:
         setup_logging(self.settings.log_level)
         print("⏳ Warming up exchanges (~3–5s)…", flush=True)
         await get_http().start()
-        await self.market.warmup()
+        try:
+            await asyncio.wait_for(self.market.warmup(), timeout=8.0)
+        except asyncio.TimeoutError:
+            logger.warning("warmup_partial")
         if self.settings.cmc_key():
             print("✅ CMC API configured (contracts from CoinMarketCap)", flush=True)
         else:
             print("⚠️  CMC_API_KEY missing in .env — contracts: exchanges only", flush=True)
-        logger.info("bot_ready", cmc=bool(self.settings.cmc_key()))
+        logger.info(
+            "bot_ready",
+            cmc=bool(self.settings.cmc_key()),
+            turbo=self.settings.turbo_mode,
+            asia=self.settings.asia_vps,
+        )
+        if self.settings.turbo_mode:
+            region = "Asia VPS" if self.settings.asia_vps else "Turbo"
+            print(
+                f"⚡ {region} — paint ~{self.settings.first_paint_ms}ms, "
+                f"enrich ~{self.settings.first_response_sec:.1f}s",
+                flush=True,
+            )
         print("✅ Bot ready. In Telegram: /get sol", flush=True)
         asyncio.create_task(self._prefetch_dw_background())
+        self.market.kick_wallet_prefetch_many()
 
     async def _prefetch_dw_background(self) -> None:
         try:

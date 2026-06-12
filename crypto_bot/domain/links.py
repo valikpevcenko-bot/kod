@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 
+def kraken_asset_code(base: str) -> str:
+    b = base.upper()
+    return "XBT" if b == "BTC" else b
+
+
 def kucoin_futures_symbol(base: str, quote: str) -> str:
     b, q = base.upper(), quote.upper()
     if b == "BTC":
@@ -22,7 +27,7 @@ def spot_url(exchange_key: str, base: str, quote: str) -> str | None:
         "okx": f"https://www.okx.com/trade-spot/{bl}-{ql}",
         "kucoin": f"https://www.kucoin.com/trade/{b}-{q}",
         "bingx": f"https://bingx.com/en-us/spot/{b}-{q}",
-        "htx": f"https://www.htx.com/trade/{bl}_{ql}",
+        "kraken": f"https://pro.kraken.com/app/trade/{kraken_asset_code(base).lower()}-{ql}",
         "aster": f"https://www.asterdex.com/en/spot/{b}{q}",
     }
     return templates.get(exchange_key)
@@ -41,7 +46,7 @@ def futures_url(exchange_key: str, base: str, quote: str) -> str | None:
         "okx": f"https://www.okx.com/trade-swap/{bl}-{ql}-swap",
         "kucoin": f"https://www.kucoin.com/futures/trade/{fut_sym}",
         "bingx": f"https://bingx.com/en-us/perpetual/{b}-{q}",
-        "htx": f"https://www.htx.com/futures/linear_swap/exchange#contract_code={b}-{q}",
+        "kraken": f"https://futures.kraken.com/trade/futures/PF_{kraken_asset_code(base)}USD",
         "aster": f"https://www.asterdex.com/en/futures/{b}{q}",
         "hyperliquid": f"https://app.hyperliquid.xyz/trade/{b}",
     }

@@ -61,6 +61,8 @@ _ALIASES: dict[str, str] = {
     "LIGHTNING NETWORK": "LIGHTNING",
     "ARBITRUM ONE": "ARBITRUM",
     "BEP20": "BSC",
+    "BNB CHAIN": "BSC",
+    "BNBCHAIN": "BSC",
     "ERC20": "ETH",
     "TRC20": "TRON",
     "OPETH": "OPTIMISM",

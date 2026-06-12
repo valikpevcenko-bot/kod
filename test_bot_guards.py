@@ -187,6 +187,40 @@ def test_coingecko_solana_contract() -> None:
     assert "BASE" in nets
 
 
+def test_native_chain_same_as_ticker() -> None:
+    from crypto_bot.clients.dw.parse import (
+        build_network_row,
+        pick_chain_field,
+        resolve_dw_network,
+    )
+    from crypto_bot.domain.network_registry import resolve_network
+
+    assert resolve_network("BDX", coin="BDX", exchange="kucoin") is None
+    assert resolve_dw_network("BDX", coin="BDX", deposit=True) == "BDX"
+    assert resolve_dw_network("BDX-Mainnet", coin="BDX", withdraw=True) == "BDX"
+    assert resolve_dw_network("MIRANETWORK", coin="MIRA", deposit=True) == "MIRA"
+    assert resolve_dw_network("Beldex", coin="BDX", deposit=True) == "BELDEX"
+    assert resolve_dw_network("MIRA", coin="MIRA") is None
+
+    row = build_network_row(
+        "BDX",
+        coin="BDX",
+        exchange="kucoin",
+        deposit=True,
+        withdraw=True,
+    )
+    assert row is not None
+    assert row.network == "BDX"
+    assert build_network_row("MIRA", coin="MIRA", exchange="kucoin") is None
+
+    payload = {
+        "chainName": "BDX",
+        "isDepositEnabled": True,
+        "isWithdrawEnabled": True,
+    }
+    assert pick_chain_field(payload, coin="BDX") == "BDX"
+
+
 def test_hide_native_l1_contract() -> None:
     from crypto_bot.clients.coinmarketcap import filter_display_contracts, is_native_chain_contract
     from crypto_bot.models.market import ContractInfo
@@ -228,6 +262,7 @@ if __name__ == "__main__":
     test_futures_only_line()
     test_snapshot_coalesce()
     test_hide_native_l1_contract()
+    test_native_chain_same_as_ticker()
     test_network_registry()
     test_dex_symbols()
     test_float_field()

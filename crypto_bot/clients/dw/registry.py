@@ -8,7 +8,7 @@ from crypto_bot.clients.dw.bingx import BingxDwClient
 from crypto_bot.clients.dw.bitget import BitgetDwClient
 from crypto_bot.clients.dw.bybit import BybitDwClient
 from crypto_bot.clients.dw.gate import GateDwClient
-from crypto_bot.clients.dw.htx import HtxDwClient
+from crypto_bot.clients.dw.kraken import KrakenDwClient
 from crypto_bot.clients.dw.kucoin import KucoinDwClient
 from crypto_bot.clients.dw.mexc import MexcDwClient
 from crypto_bot.clients.dw.okx import OkxDwClient
@@ -24,7 +24,7 @@ DW_EXCHANGE_KEYS: frozenset[str] = frozenset(
         "bitget",
         "kucoin",
         "bingx",
-        "htx",
+        "kraken",
     }
 )
 
@@ -39,6 +39,6 @@ def build_dw_clients(http: HttpClient) -> dict[str, DepositWithdrawalClient]:
         BitgetDwClient(http),
         KucoinDwClient(http),
         BingxDwClient(http),
-        HtxDwClient(http),
+        KrakenDwClient(http),
     ]
     return {c.exchange_key: c for c in clients}

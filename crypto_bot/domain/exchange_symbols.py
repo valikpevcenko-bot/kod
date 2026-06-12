@@ -33,8 +33,11 @@ def _fallback_symbol(exchange: str, market: MarketKind, base: str, quote: str) -
         return kucoin_futures_symbol(b, q) if market == "futures" else f"{b}-{q}"
     if exchange == "mexc" and market == "futures":
         return f"{b}_{q}"
-    if exchange == "htx":
-        return f"{b.lower()}{q.lower()}" if market == "spot" else f"{b}-{q}"
+    if exchange == "kraken":
+        asset = "XBT" if b == "BTC" else b
+        if market == "futures":
+            return f"PF_{asset}USD"
+        return f"{asset}{q}"
     if exchange == "hyperliquid":
         return b
     return concat
@@ -370,19 +373,63 @@ async def _load_bingx(resolver: ExchangeSymbolResolver) -> IndexStore:
     return store
 
 
-async def _load_htx(resolver: ExchangeSymbolResolver) -> IndexStore:
+def _kraken_base_name(wsname: str | None, altname: str) -> str | None:
+    if wsname and "/" in wsname:
+        base = wsname.split("/", 1)[0].strip().upper()
+    else:
+        base = altname.upper()
+        for q in ("USDT", "USDC", "USD", "EUR"):
+            if base.endswith(q):
+                base = base[: -len(q)]
+                break
+    if base == "XBT":
+        return "BTC"
+    return base or None
+
+
+def _kraken_quote_name(quote_code: str) -> str:
+    q = quote_code.upper()
+    if q in ("ZUSD", "USD"):
+        return "USD"
+    return q
+
+
+async def _load_kraken(resolver: ExchangeSymbolResolver) -> IndexStore:
     store: IndexStore = {}
-    data = await resolver._http.get_json(
-        "https://api.huobi.pro/v1/common/symbols",
+    spot_raw = await resolver._http.get_json(
+        "https://api.kraken.com/0/public/AssetPairs",
         timeout=8,
     )
-    if isinstance(data, dict) and data.get("status") == "ok":
-        for item in data.get("data") or []:
-            if not isinstance(item, dict) or item.get("state") != "online":
+    if isinstance(spot_raw, dict) and not spot_raw.get("error"):
+        for item in (spot_raw.get("result") or {}).values():
+            if not isinstance(item, dict) or item.get("status") != "online":
                 continue
-            base = str(item.get("base-currency") or item.get("bc") or "").upper()
-            quote = str(item.get("quote-currency") or item.get("qc") or "").upper()
-            resolver._register(store, base, quote, "spot", f"{base.lower()}{quote.lower()}")
+            altname = str(item.get("altname") or "")
+            base = _kraken_base_name(item.get("wsname"), altname)
+            quote = _kraken_quote_name(str(item.get("quote") or ""))
+            if not base or not quote:
+                continue
+            resolver._register(store, base, quote, "spot", altname)
+
+    fut_raw = await resolver._http.get_json(
+        "https://futures.kraken.com/derivatives/api/v3/tickers",
+        timeout=8,
+    )
+    if isinstance(fut_raw, dict) and fut_raw.get("result") == "success":
+        for row in fut_raw.get("tickers") or []:
+            if not isinstance(row, dict) or row.get("tag") != "perpetual":
+                continue
+            sym = str(row.get("symbol") or "")
+            if not sym.startswith("PF_"):
+                continue
+            pair = str(row.get("pair") or "")
+            if ":" not in pair:
+                continue
+            base = pair.split(":", 1)[0].strip().upper()
+            if base == "XBT":
+                base = "BTC"
+            resolver._register(store, base, "USDT", "futures", sym)
+            resolver._register(store, base, "USD", "futures", sym)
     return store
 
 
@@ -441,7 +488,7 @@ _LOADERS: dict[str, Callable[[ExchangeSymbolResolver], Awaitable[IndexStore]]] =
     "bitget": _load_bitget,
     "kucoin": _load_kucoin,
     "bingx": _load_bingx,
-    "htx": _load_htx,
+    "kraken": _load_kraken,
     "aster": _load_aster,
     "hyperliquid": _load_hyperliquid,
 }

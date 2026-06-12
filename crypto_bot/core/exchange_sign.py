@@ -50,6 +50,22 @@ def bingx_sign(secret: str, payload: str) -> str:
     return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
+def kraken_sign(secret_b64: str, path: str, data: dict[str, Any]) -> str:
+    postdata = urlencode(data)
+    encoded = (str(data["nonce"]) + postdata).encode()
+    message = path.encode() + hashlib.sha256(encoded).digest()
+    digest = hmac.new(base64.b64decode(secret_b64), message, hashlib.sha512).digest()
+    return base64.b64encode(digest).decode()
+
+
+def kraken_private_headers(api_key: str, secret_b64: str, path: str, data: dict[str, Any]) -> dict[str, str]:
+    return {
+        "API-Key": api_key,
+        "API-Sign": kraken_sign(secret_b64, path, data),
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+
 def bingx_timestamp_params(api_key: str, secret: str, params: dict[str, Any]) -> dict[str, Any]:
     ts = int(time.time() * 1000)
     full = {**params, "timestamp": ts}

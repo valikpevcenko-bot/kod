@@ -8,7 +8,19 @@ import sys
 from crypto_bot.app import BotApp
 
 
+def _install_uvloop() -> None:
+    if sys.platform == "win32":
+        return
+    try:
+        import uvloop
+
+        uvloop.install()
+    except ImportError:
+        pass
+
+
 def main() -> None:
+    _install_uvloop()
     try:
         asyncio.run(BotApp().run())
     except KeyboardInterrupt:

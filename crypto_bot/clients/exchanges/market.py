@@ -27,6 +27,8 @@ _mexc_fut_cache: tuple[float, dict[str, float]] | None = None
 _MEXC_FUT_CACHE_TTL = 120
 _hl_asset_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
 _HL_ASSET_CACHE_TTL = 25
+_kraken_fut_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
+_KRAKEN_FUT_CACHE_TTL = 25
 _LEG_TIMEOUT = 2.0
 _LEG_RETRY_ATTEMPTS = 3
 
@@ -60,7 +62,7 @@ class ExchangeMarketClient:
         try:
             spot_fn = _SPOT_ONLY.get(exchange_key)
             fut_fn = _FUTURES_ONLY.get(exchange_key)
-            leg_t = 0.55
+            leg_t = 0.48 if price_fast_ctx.get() else _LEG_TIMEOUT
             if spot_fn and fut_fn:
                 spot_p, fut_p = await self._pair_resilient(
                     exchange_key,
@@ -130,6 +132,12 @@ class ExchangeMarketClient:
     async def warm_hyperliquid_assets(self) -> None:
         try:
             await asyncio.wait_for(self._hyperliquid_assets(), timeout=6.0)
+        except Exception:
+            pass
+
+    async def warm_kraken_futures_tickers(self) -> None:
+        try:
+            await asyncio.wait_for(self._kraken_futures_tickers(), timeout=6.0)
         except Exception:
             pass
 
@@ -667,43 +675,70 @@ class ExchangeMarketClient:
                 return float(payload["lastFundingRate"]), int(payload.get("nextFundingTime") or 0)
         return None, None
 
-    # --- HTX ---
+    # --- Kraken ---
 
-    async def htx_spot(self, base: str, quote: str) -> float | None:
-        symbol = await self._sym("htx", base, quote, "spot")
-        spot_raw = await self._http.get_json(
-            "https://api.htx.com/market/detail/merged",
-            params={"symbol": symbol},
-        )
-        if isinstance(spot_raw, dict) and spot_raw.get("status") == "ok":
-            return guards.price_positive((spot_raw.get("tick") or {}).get("close"))
-        return None
-
-    async def htx_futures(self, base: str, quote: str) -> float | None:
-        contract = await self._sym("htx", base, quote, "futures")
-        fut_raw = await self._http.get_json(
-            "https://api.hbdm.com/linear-swap-ex/market/detail/merged",
-            params={"contract_code": contract},
-        )
-        if isinstance(fut_raw, dict) and (fut_raw.get("status") == "ok" or fut_raw.get("err_code") == 0):
-            return guards.price_positive((fut_raw.get("tick") or {}).get("close"))
-        return None
-
-    async def htx_prices(self, base: str, quote: str) -> tuple[float | None, float | None]:
-        return await self._pair_resilient("htx", self.htx_spot, self.htx_futures, base, quote)
-
-    async def htx_funding(self, base: str, quote: str) -> tuple[float | None, int | None]:
-        contract = await self._sym("htx", base, quote, "futures")
+    async def _kraken_futures_tickers(self) -> dict[str, dict[str, Any]]:
+        global _kraken_fut_cache
+        now = time.time()
+        if _kraken_fut_cache and now - _kraken_fut_cache[0] < _KRAKEN_FUT_CACHE_TTL:
+            return _kraken_fut_cache[1]
         data = await self._http.get_json(
-            "https://api.hbdm.com/linear-swap-api/v1/swap_funding_rate",
-            params={"contract_code": contract},
+            "https://futures.kraken.com/derivatives/api/v3/tickers",
+            timeout=5,
         )
-        if isinstance(data, dict) and data.get("status") == "ok":
-            payload = data.get("data") or {}
-            rate = payload.get("funding_rate")
-            nxt = payload.get("funding_time")
-            if rate is not None:
-                return float(rate), int(nxt) if nxt else None
+        out: dict[str, dict[str, Any]] = {}
+        if isinstance(data, dict) and data.get("result") == "success":
+            for row in data.get("tickers") or []:
+                if isinstance(row, dict):
+                    sym = str(row.get("symbol") or "")
+                    if sym:
+                        out[sym] = row
+        _kraken_fut_cache = (now, out)
+        return out
+
+    async def kraken_spot(self, base: str, quote: str) -> float | None:
+        pair = await self._sym("kraken", base, quote, "spot")
+        if not pair:
+            return None
+        spot_raw = await self._http.get_json(
+            "https://api.kraken.com/0/public/Ticker",
+            params={"pair": pair},
+        )
+        if not isinstance(spot_raw, dict) or spot_raw.get("error"):
+            return None
+        for payload in (spot_raw.get("result") or {}).values():
+            if isinstance(payload, dict):
+                close = payload.get("c")
+                if isinstance(close, list) and close:
+                    return guards.price_positive(close[0])
+        return None
+
+    async def kraken_futures(self, base: str, quote: str) -> float | None:
+        sym = await self._sym("kraken", base, quote, "futures")
+        if not sym:
+            return None
+        row = (await self._kraken_futures_tickers()).get(sym)
+        if not row:
+            return None
+        return guards.price_positive(row.get("markPrice") or row.get("last"))
+
+    async def kraken_prices(self, base: str, quote: str) -> tuple[float | None, float | None]:
+        return await self._pair_resilient(
+            "kraken", self.kraken_spot, self.kraken_futures, base, quote
+        )
+
+    async def kraken_funding(self, base: str, quote: str) -> tuple[float | None, int | None]:
+        sym = await self._sym("kraken", base, quote, "futures")
+        if not sym:
+            return None, None
+        row = (await self._kraken_futures_tickers()).get(sym)
+        if not row:
+            return None, None
+        rate = guards.float_field(row.get("fundingRate"))
+        if rate is not None:
+            if abs(rate) > 0.01:
+                rate /= 100.0
+            return rate, _estimate_next_funding_hourly_ms()
         return None, None
 
     # --- Aster ---
@@ -778,6 +813,12 @@ def _estimate_next_funding_ms() -> int:
     return ((now // period) + 1) * period * 1000
 
 
+def _estimate_next_funding_hourly_ms() -> int:
+    period = 3600
+    now = int(time.time())
+    return ((now // period) + 1) * period * 1000
+
+
 def apply_funding(ticker: MarketTicker, rate: float | None, ts: int | None) -> None:
     if rate is None:
         return
@@ -797,7 +838,7 @@ _PRICE_FETCHERS: dict[str, Callable[[ExchangeMarketClient, str, str], Awaitable[
     "bitget": ExchangeMarketClient.bitget_prices,
     "kucoin": ExchangeMarketClient.kucoin_prices,
     "bingx": ExchangeMarketClient.bingx_prices,
-    "htx": ExchangeMarketClient.htx_prices,
+    "kraken": ExchangeMarketClient.kraken_prices,
     "aster": ExchangeMarketClient.aster_prices,
     "hyperliquid": ExchangeMarketClient.hyperliquid_prices,
 }
@@ -811,7 +852,7 @@ _SPOT_ONLY: dict[str, Callable[[ExchangeMarketClient, str, str], Awaitable[float
     "bitget": ExchangeMarketClient.bitget_spot,
     "kucoin": ExchangeMarketClient.kucoin_spot,
     "bingx": ExchangeMarketClient.bingx_spot,
-    "htx": ExchangeMarketClient.htx_spot,
+    "kraken": ExchangeMarketClient.kraken_spot,
     "aster": ExchangeMarketClient.aster_spot,
 }
 
@@ -824,7 +865,7 @@ _FUTURES_ONLY: dict[str, Callable[[ExchangeMarketClient, str, str], Awaitable[fl
     "bitget": ExchangeMarketClient.bitget_futures,
     "kucoin": ExchangeMarketClient.kucoin_futures,
     "bingx": ExchangeMarketClient.bingx_futures,
-    "htx": ExchangeMarketClient.htx_futures,
+    "kraken": ExchangeMarketClient.kraken_futures,
     "aster": ExchangeMarketClient.aster_futures,
     "hyperliquid": ExchangeMarketClient.hyperliquid_futures_price,
 }
@@ -838,7 +879,7 @@ _FUNDING_FETCHERS: dict[str, Callable[[ExchangeMarketClient, str, str], Awaitabl
     "bitget": ExchangeMarketClient.bitget_funding,
     "kucoin": ExchangeMarketClient.kucoin_funding,
     "bingx": ExchangeMarketClient.bingx_funding,
-    "htx": ExchangeMarketClient.htx_funding,
+    "kraken": ExchangeMarketClient.kraken_funding,
     "aster": ExchangeMarketClient.aster_funding,
     "hyperliquid": ExchangeMarketClient.hyperliquid_funding,
 }

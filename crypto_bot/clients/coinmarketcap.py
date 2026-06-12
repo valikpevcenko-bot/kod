@@ -102,7 +102,9 @@ NETWORK_ORDER = {
 EXCHANGE_PRIORITY = ("binance", "bitget", "gate", "kucoin", "mexc", "okx", "bybit", "bingx")
 
 _map_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_info_cache: dict[int, tuple[float, list[ContractInfo]]] = {}
 _MAP_TTL = 3600
+_INFO_TTL = 3600
 
 
 def _match_chain_alias(text: str) -> str | None:
@@ -240,6 +242,9 @@ class CoinMarketCapClient:
         return entries
 
     async def contracts_by_id(self, cmc_id: int) -> list[ContractInfo]:
+        hit = _info_cache.get(cmc_id)
+        if hit and time.time() - hit[0] < _INFO_TTL:
+            return hit[1]
         data = await self._http.get_json(
             "https://pro-api.coinmarketcap.com/v2/cryptocurrency/info",
             headers=self._headers(),
@@ -265,6 +270,7 @@ class CoinMarketCapClient:
                 if is_evm(addr) or (label == "SOL" and is_solana(addr)):
                     out.append(ContractInfo(network=label, address=addr))
         out.sort(key=lambda c: (NETWORK_ORDER.get(c.network, 99), c.network))
+        _info_cache[cmc_id] = (time.time(), out)
         return out
 
     @staticmethod

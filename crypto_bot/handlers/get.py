@@ -11,8 +11,12 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from crypto_bot.config.settings import get_settings
-from crypto_bot.domain.exchanges import FETCH_HARD_TIMEOUT, REPORT_EXCHANGE_COUNT
-from crypto_bot.services.report_ui import needs_more_exchanges, with_loading_footer
+from crypto_bot.domain.exchanges import (
+    FETCH_HARD_TIMEOUT,
+    LOADING_FOOTER_MIN_EXCHANGES,
+    REPORT_EXCHANGE_COUNT,
+)
+from crypto_bot.services.report_ui import show_loading_footer, with_loading_footer
 from crypto_bot.domain.ticker import parse_ticker
 from crypto_bot.services.market_service import MarketService
 from crypto_bot.services.report_cache import ReportCache
@@ -20,11 +24,12 @@ from crypto_bot.services.report_cache import ReportCache
 logger = structlog.get_logger(__name__)
 router = Router(name="get")
 
-_FIRST_WAIT = 0.4
-
-
 def setup_get_router(market: MarketService, cache: ReportCache) -> Router:
     settings = get_settings()
+    if settings.turbo_mode:
+        first_wait = settings.first_paint_ms / 1000.0
+    else:
+        first_wait = settings.fast_wait_ms / 1000.0
 
     async def _load_snapshots(
         base: str,
@@ -53,7 +58,7 @@ def setup_get_router(market: MarketService, cache: ReportCache) -> Router:
     ) -> Message:
         report = market.report_text(base, quote, snapshots, contracts)
         ex_count = market._exchange_count(snapshots)
-        if ex_count > 0 and needs_more_exchanges(ex_count, target=REPORT_EXCHANGE_COUNT):
+        if show_loading_footer(ex_count, target=LOADING_FOOTER_MIN_EXCHANGES):
             report = with_loading_footer(report)
         cache.set(base, quote, report, snapshots, contracts, complete=False)
         if status is not None:
@@ -85,20 +90,22 @@ def setup_get_router(market: MarketService, cache: ReportCache) -> Router:
 
         t0 = time.perf_counter()
         pair_key = f"{base.upper()}:{quote.upper()}"
+        market.kick_wallet_prefetch(base)
 
         instant = market.peek_fast(base, quote)
         if instant:
             text = instant.text
-            if needs_more_exchanges(
-                market._exchange_count(instant.snapshots), target=REPORT_EXCHANGE_COUNT
+            if show_loading_footer(
+                market._exchange_count(instant.snapshots),
+                target=LOADING_FOOTER_MIN_EXCHANGES,
             ):
                 text = with_loading_footer(text)
             msg = await message.answer(text, disable_web_page_preview=True)
             logger.info("fast_cache_hit", base=base, ms=int((time.perf_counter() - t0) * 1000))
             if market._exchange_count(instant.snapshots) > 0 and (
                 not instant.complete
-                or needs_more_exchanges(
-                    market._exchange_count(instant.snapshots), target=REPORT_EXCHANGE_COUNT
+                or market._needs_enrich(
+                    instant.snapshots, instant.contracts, base
                 )
             ):
                 market.schedule_enrich(
@@ -120,9 +127,6 @@ def setup_get_router(market: MarketService, cache: ReportCache) -> Router:
             if (
                 stale
                 or not cached.complete
-                or needs_more_exchanges(
-                    market._exchange_count(cached.snapshots), target=REPORT_EXCHANGE_COUNT
-                )
                 or market._needs_enrich(cached.snapshots, cached.contracts, base)
             ):
                 market.schedule_enrich(
@@ -147,13 +151,20 @@ def setup_get_router(market: MarketService, cache: ReportCache) -> Router:
         try:
             try:
                 snapshots, contracts = await asyncio.wait_for(
-                    asyncio.shield(fetch_task), timeout=_FIRST_WAIT
+                    asyncio.shield(fetch_task), timeout=first_wait
                 )
             except asyncio.TimeoutError:
-                status = await message.answer(f"⏳ <b>{base}</b>…")
-                snapshots, contracts = await _load_snapshots(
-                    base, quote, task=fetch_task
-                )
+                snapshots, contracts = [], []
+                if fetch_task.done():
+                    try:
+                        snapshots, contracts = fetch_task.result()
+                    except Exception:
+                        pass
+                if not snapshots:
+                    status = await message.answer(f"⏳ <b>{base}</b>…")
+                    snapshots, contracts = await _load_snapshots(
+                        base, quote, task=fetch_task
+                    )
 
             await _deliver(
                 base,

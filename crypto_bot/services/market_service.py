@@ -12,6 +12,7 @@ from crypto_bot.clients.coinmarketcap import filter_display_contracts
 from crypto_bot.clients.exchanges.market import ExchangeMarketClient, apply_funding
 from crypto_bot.config.settings import get_settings
 from crypto_bot.domain import links
+from crypto_bot.core.price_fast import price_fast_ctx
 from crypto_bot.domain.exchanges import (
     CONTRACT_HTTP_TIMEOUT,
     ENRICH_JOB_TIMEOUT,
@@ -36,6 +37,14 @@ from crypto_bot.domain.exchanges import (
     REPORT_EXCHANGE_COUNT,
     RETRY_EXCHANGE_PRIORITY,
     SPOT_EXCHANGE_DEFS,
+    TURBO_BACKFILL_TIMEOUT,
+    TURBO_ENRICH_PRICES_TIMEOUT,
+    TURBO_EXCHANGE_TIMEOUT_FAST,
+    TURBO_EXCHANGE_TIMEOUT_SLOW,
+    TURBO_FETCH_TIMEOUT,
+    TURBO_FUNDING_TIMEOUT,
+    TURBO_PRICE_CONTINUATION_TIMEOUT,
+    TURBO_WALLET_PHASE_TIMEOUT,
 )
 from crypto_bot.services.report_ui import strip_loading_footer
 from crypto_bot.services.snapshot_merge import coalesce_snapshot, merge_snapshots
@@ -52,8 +61,10 @@ from crypto_bot.services.dw_service import (
 
 logger = structlog.get_logger(__name__)
 
-_PRICE_CONCURRENCY = 10
+_PRICE_CONCURRENCY = 24
 _EDIT_MIN_INTERVAL = 0.35
+_EDIT_MIN_INTERVAL_TURBO = 0.08
+_WALLET_PREFETCH_SYMBOLS = ("SOL", "BTC", "ETH", "USDT")
 
 
 class FastBundle(NamedTuple):
@@ -83,11 +94,49 @@ class MarketService:
         self._inflight_fast: dict[str, asyncio.Task[tuple[list[ExchangeSnapshot], list[ContractInfo]]]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._enrich_tasks: dict[str, asyncio.Task] = {}
+        self._price_continuations: dict[str, list[asyncio.Task]] = {}
         self._price_sem = asyncio.Semaphore(_PRICE_CONCURRENCY)
         self._last_edit: dict[str, tuple[str, float]] = {}
+        self._wallet_prefetch: dict[str, asyncio.Task[None]] = {}
 
     def _pair_key(self, base: str, quote: str) -> str:
         return f"{base.upper()}:{quote.upper()}"
+
+    def kick_wallet_prefetch(self, symbol: str) -> None:
+        """Start D/W fetch in background — overlaps with price wave on Asia VPS."""
+        sym = symbol.upper()
+        existing = self._wallet_prefetch.get(sym)
+        if existing is not None and not existing.done():
+            return
+
+        async def _run() -> None:
+            keys = self._wallet_keys_to_prefetch(sym)
+            if not keys:
+                return
+            fresh = await self._fetch_wallets_parallel(sym, keys)
+            for key, wallet in fresh.items():
+                if wallet_has_rows(wallet):
+                    wallet_cache_set(key, sym, wallet)
+
+        task = asyncio.create_task(_run())
+        self._wallet_prefetch[sym] = task
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    def kick_wallet_prefetch_many(self, symbols: tuple[str, ...] = _WALLET_PREFETCH_SYMBOLS) -> None:
+        for sym in symbols:
+            self.kick_wallet_prefetch(sym)
+
+    def _wallet_keys_to_prefetch(self, sym: str) -> list[str]:
+        keys: list[str] = []
+        for defn in SPOT_EXCHANGE_DEFS:
+            if defn.key not in DW_EXCHANGE_KEYS:
+                continue
+            cached = wallet_cache_get(defn.key, sym)
+            if cached is not None and wallet_has_rows(cached):
+                continue
+            keys.append(defn.key)
+        return keys
 
     async def prefetch_dw_cache(self) -> None:
         """Прогрів MEXC capital/config (важкий список монет)."""
@@ -110,7 +159,7 @@ class MarketService:
                     "mexc",
                     "gate",
                     "kucoin",
-                    "htx",
+                    "kraken",
                     "okx",
                     "bingx",
                     "aster",
@@ -119,6 +168,7 @@ class MarketService:
             ),
             self._market.warm_mexc_futures_map(),
             self._market.warm_hyperliquid_assets(),
+            self._market.warm_kraken_futures_tickers(),
             http.get_json("https://api.binance.com/api/v3/ping"),
             return_exceptions=True,
         )
@@ -154,6 +204,39 @@ class MarketService:
         self._miss_cache.delete(key)
 
         sym = base.upper()
+        self.kick_wallet_prefetch(sym)
+        turbo = self._settings.turbo_mode
+        token = price_fast_ctx.set(True)
+        try:
+            if turbo:
+                snapshots, contracts = await self._fetch_turbo_wave(base, quote, sym)
+            else:
+                snapshots, contracts = await self._fetch_standard_fast(base, quote, sym)
+        finally:
+            price_fast_ctx.reset(token)
+
+        self._attach_wallets_cache_only(snapshots, sym)
+
+        from crypto_bot.services.formatter import format_report_safe
+
+        text = format_report_safe(base, quote, snapshots, contracts)
+        complete = self._report_complete(snapshots, contracts, base)
+        bundle = FastBundle(
+            text=text,
+            snapshots=snapshots,
+            contracts=contracts,
+            complete=complete,
+        )
+        if self._exchange_count(snapshots) > 0:
+            self._fast_cache.set(key, bundle)
+        return snapshots, contracts
+
+    async def _fetch_standard_fast(
+        self,
+        base: str,
+        quote: str,
+        sym: str,
+    ) -> tuple[list[ExchangeSnapshot], list[ContractInfo]]:
         try:
             snapshots = await asyncio.wait_for(
                 self._fetch_burst(base, quote, fast=True),
@@ -171,21 +254,103 @@ class MarketService:
             pass
 
         contracts = filter_display_contracts(self._contracts.cached(sym), coin=sym) or []
-        self._attach_wallets_cache_only(snapshots, sym)
-
-        from crypto_bot.services.formatter import format_report_safe
-
-        text = format_report_safe(base, quote, snapshots, contracts)
-        complete = self._report_complete(snapshots, contracts, base)
-        bundle = FastBundle(
-            text=text,
-            snapshots=snapshots,
-            contracts=contracts,
-            complete=complete,
-        )
-        if self._exchange_count(snapshots) > 0:
-            self._fast_cache.set(key, bundle)
         return snapshots, contracts
+
+    async def _fetch_turbo_wave(
+        self,
+        base: str,
+        quote: str,
+        sym: str,
+    ) -> tuple[list[ExchangeSnapshot], list[ContractInfo]]:
+        """Progressive paint: первые биржи за ~FIRST_PAINT_MS, остальные — в enrich."""
+        pair_key = self._pair_key(base, quote)
+        wall = min(
+            max(self._settings.first_response_sec, 0.7),
+            TURBO_FETCH_TIMEOUT + 0.12,
+        )
+        first_paint = max(
+            self._settings.first_paint_ms / 1000.0,
+            0.20 if self._settings.asia_vps else 0.22,
+        )
+        listed = [d.key for d in SPOT_EXCHANGE_DEFS]
+        contracts_cached = filter_display_contracts(self._contracts.cached(sym), coin=sym)
+
+        by_key: dict[str, ExchangeSnapshot] = {}
+        price_tasks = [
+            asyncio.create_task(self._fetch_one(d, base, quote, fast=True))
+            for d in EXCHANGE_DEFS
+        ]
+        pending = set(price_tasks)
+        contracts_box: list[list[ContractInfo]] = [contracts_cached or []]
+        contract_task: asyncio.Task | None = None
+
+        async def _load_contracts() -> None:
+            fetched = await self._contracts.fetch(base, listed_on=listed)
+            contracts_box[0] = filter_display_contracts(fetched, coin=sym) or fetched
+
+        if not contracts_cached:
+            contract_task = asyncio.create_task(_load_contracts())
+
+        started = time.monotonic()
+        while pending:
+            elapsed = time.monotonic() - started
+            if elapsed >= wall:
+                break
+            if len(by_key) >= 8:
+                break
+            if elapsed >= first_paint:
+                break
+            tick = min(0.05, wall - elapsed, first_paint - elapsed)
+            if tick <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=tick, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    snap = task.result()
+                    if snap.has_data:
+                        by_key[snap.key] = coalesce_snapshot(
+                            by_key.get(snap.key), snap
+                        )
+                except Exception:
+                    pass
+
+        if pending:
+            self._price_continuations[pair_key] = list(pending)
+
+        if contract_task is not None and not contract_task.done():
+            try:
+                await asyncio.wait_for(contract_task, timeout=0.04)
+            except asyncio.TimeoutError:
+                pass
+
+        snapshots = self._merge(by_key)
+        contracts = contracts_box[0]
+        if not contracts:
+            contracts = filter_display_contracts(self._contracts.cached(sym), coin=sym) or []
+        return snapshots, contracts
+
+    async def _absorb_price_continuations(
+        self,
+        pair_key: str,
+        by_key: dict[str, ExchangeSnapshot],
+        *,
+        timeout: float = TURBO_PRICE_CONTINUATION_TIMEOUT,
+    ) -> None:
+        tasks = self._price_continuations.pop(pair_key, [])
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(set(tasks), timeout=timeout)
+        for task in done:
+            try:
+                snap = task.result()
+                if isinstance(snap, ExchangeSnapshot) and snap.has_data:
+                    by_key[snap.key] = coalesce_snapshot(by_key.get(snap.key), snap)
+            except Exception:
+                pass
+        for task in pending:
+            task.cancel()
 
     async def enrich(
         self,
@@ -210,6 +375,7 @@ class MarketService:
                 cont = fresh_cont
 
         wallet_keys = self._wallet_keys_to_fetch(snaps, sym)
+        self.kick_wallet_prefetch(sym)
         wallet_task = asyncio.create_task(
             self._fetch_wallets_parallel(sym, wallet_keys)
         )
@@ -220,16 +386,25 @@ class MarketService:
         await self._ensure_funding(snaps, base, quote)
         self._attach_wallets_cache_only(snaps, sym)
 
-        text_prices = format_report_safe(base, quote, snaps, cont)
-        if on_update:
+        split = self._settings.turbo_mode and self._settings.enrich_split
+        if split and on_update:
+            mid_text = format_report_safe(base, quote, snaps, cont)
             await self._push_edit(
-                pair_key, on_update, text_prices, snaps, cont, complete=False
+                pair_key,
+                on_update,
+                mid_text,
+                snaps,
+                cont,
+                complete=False,
             )
 
+        wallet_limit = (
+            TURBO_WALLET_PHASE_TIMEOUT
+            if self._settings.turbo_mode
+            else ENRICH_WALLET_PHASE_TIMEOUT
+        )
         try:
-            fresh_wallets = await asyncio.wait_for(
-                wallet_task, timeout=ENRICH_WALLET_PHASE_TIMEOUT
-            )
+            fresh_wallets = await asyncio.wait_for(wallet_task, timeout=wallet_limit)
         except asyncio.TimeoutError:
             logger.warning("enrich_wallet_phase_timeout", base=base)
             fresh_wallets = {}
@@ -264,8 +439,13 @@ class MarketService:
         now = time.monotonic()
         if prev and strip_loading_footer(prev[0]) == strip_loading_footer(text):
             return
-        if prev and now - prev[1] < _EDIT_MIN_INTERVAL:
-            await asyncio.sleep(_EDIT_MIN_INTERVAL - (now - prev[1]))
+        min_gap = (
+            _EDIT_MIN_INTERVAL_TURBO
+            if self._settings.turbo_mode
+            else _EDIT_MIN_INTERVAL
+        )
+        if prev and now - prev[1] < min_gap:
+            await asyncio.sleep(min_gap - (now - prev[1]))
         self._last_edit[pair_key] = (text, time.monotonic())
         await on_update(text, snaps, cont, complete=complete)
 
@@ -454,7 +634,17 @@ class MarketService:
         fast: bool = False,
     ) -> ExchangeSnapshot:
         if fast:
-            limit = FAST_EXCHANGE_TIMEOUT
+            if self._settings.turbo_mode:
+                if defn.key in FAST_TIER_KEYS:
+                    limit = TURBO_EXCHANGE_TIMEOUT_FAST
+                elif defn.key in DEX_EXCHANGE_KEYS or defn.key == "gate":
+                    limit = TURBO_EXCHANGE_TIMEOUT_SLOW
+                elif defn.key == "kraken":
+                    limit = 0.95
+                else:
+                    limit = 0.72
+            else:
+                limit = FAST_EXCHANGE_TIMEOUT
         else:
             limit = EXCHANGE_PRICE_TIMEOUT.get(defn.key, PER_EXCHANGE_TIMEOUT)
         try:
@@ -506,14 +696,25 @@ class MarketService:
         base: str,
         quote: str,
     ) -> list[ExchangeSnapshot]:
+        pair_key = self._pair_key(base, quote)
         by_key = {s.key: s for s in snapshots}
+        if self._settings.turbo_mode:
+            await self._absorb_price_continuations(pair_key, by_key)
+
         missing = [
             EXCHANGE_BY_KEY[d.key]
             for d in EXCHANGE_DEFS
             if d.key not in by_key or not by_key[d.key].has_data
         ]
+        enrich_prices_t = (
+            TURBO_ENRICH_PRICES_TIMEOUT
+            if self._settings.turbo_mode
+            else ENRICH_PRICES_TIMEOUT
+        )
         if missing:
-            await self._run_price_batch(missing, base, quote, by_key, ENRICH_PRICES_TIMEOUT)
+            await self._run_price_batch(
+                missing, base, quote, by_key, enrich_prices_t, cancel_pending=False
+            )
 
         retry = [
             EXCHANGE_BY_KEY[k]
@@ -521,29 +722,42 @@ class MarketService:
             if k in EXCHANGE_BY_KEY and (k not in by_key or not by_key[k].has_data)
         ]
         if retry:
-            await self._run_price_batch(retry, base, quote, by_key, ENRICH_RETRY_TIMEOUT)
+            await self._run_price_batch(
+                retry, base, quote, by_key, ENRICH_RETRY_TIMEOUT, cancel_pending=True
+            )
 
-        gate = by_key.get("gate")
-        if gate is None or not gate.has_data:
-            extra = await self._fetch_one(EXCHANGE_BY_KEY["gate"], base, quote, fast=False)
-            by_key["gate"] = coalesce_snapshot(by_key.get("gate"), extra)
+        if not self._settings.turbo_mode:
+            gate = by_key.get("gate")
+            if gate is None or not gate.has_data:
+                extra = await self._fetch_one(
+                    EXCHANGE_BY_KEY["gate"], base, quote, fast=False
+                )
+                by_key["gate"] = coalesce_snapshot(by_key.get("gate"), extra)
 
-        for key in ("okx", *DEX_EXCHANGE_KEYS):
-            snap = by_key.get(key)
-            if snap is None or not snap.has_data:
-                defn = EXCHANGE_BY_KEY.get(key)
-                if defn:
-                    extra = await self._fetch_one(defn, base, quote, fast=False)
-                    by_key[key] = coalesce_snapshot(by_key.get(key), extra)
+            for key in ("okx", *DEX_EXCHANGE_KEYS):
+                snap = by_key.get(key)
+                if snap is None or not snap.has_data:
+                    defn = EXCHANGE_BY_KEY.get(key)
+                    if defn:
+                        extra = await self._fetch_one(defn, base, quote, fast=False)
+                        by_key[key] = coalesce_snapshot(by_key.get(key), extra)
 
         snaps = self._merge(by_key)
+        backfill_t = 1.2 if self._settings.turbo_mode else 2.5
         try:
             await asyncio.wait_for(
                 self._backfill_snapshot_legs(snaps, base, quote),
-                timeout=2.5,
+                timeout=backfill_t,
             )
         except asyncio.TimeoutError:
             pass
+        if self._settings.turbo_mode:
+            try:
+                await self._ensure_funding(
+                    snaps, base, quote, timeout=TURBO_FUNDING_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                pass
         return snaps
 
     async def _run_price_batch(
@@ -553,14 +767,23 @@ class MarketService:
         quote: str,
         by_key: dict[str, ExchangeSnapshot],
         timeout: float,
+        *,
+        fast: bool = False,
+        cancel_pending: bool = True,
     ) -> None:
         tasks = [
-            asyncio.create_task(self._fetch_one(d, base, quote, fast=False))
+            asyncio.create_task(self._fetch_one(d, base, quote, fast=fast))
             for d in defns
         ]
         done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
+        if cancel_pending:
+            for task in pending:
+                task.cancel()
+        elif pending:
+            extra = await asyncio.wait(set(pending), timeout=0.8)
+            done = set(done) | extra[0]
+            for task in extra[1]:
+                task.cancel()
         for task in done:
             try:
                 item = task.result()
@@ -671,12 +894,12 @@ class MarketService:
             return {}
 
         timeouts: dict[str, float] = {
-            "mexc": 14.0,
-            "gate": 14.0,
-            "htx": 8.0,
-            "kucoin": 7.0,
+            "mexc": 11.0 if self._settings.asia_vps else 14.0,
+            "gate": 11.0 if self._settings.asia_vps else 14.0,
+            "kraken": 6.0,
+            "kucoin": 6.0,
         }
-        default_t = 6.0
+        default_t = 5.0 if self._settings.asia_vps else 6.0
 
         async def _one(key: str) -> tuple[str, WalletStatus]:
             hit = wallet_cache_get(key, symbol)
@@ -711,6 +934,8 @@ class MarketService:
         snapshots: list[ExchangeSnapshot],
         base: str,
         quote: str,
+        *,
+        timeout: float | None = None,
     ) -> None:
         from crypto_bot.clients.exchanges.market import _FUNDING_FETCHERS
 
@@ -723,8 +948,9 @@ class MarketService:
         ]
         if not need_keys:
             return
+        batch_t = timeout if timeout is not None else FUNDING_BATCH_TIMEOUT
         funding_map = await self._market.funding_map(
-            base, quote, keys=need_keys, timeout=FUNDING_BATCH_TIMEOUT
+            base, quote, keys=need_keys, timeout=batch_t
         )
         self._apply_funding(snapshots, funding_map)
         still = [
